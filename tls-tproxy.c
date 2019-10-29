@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -6,6 +7,8 @@
 #include <string.h>
 
 #include <libdill.h>
+#undef bsend
+#undef brecv
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -32,24 +35,60 @@ static int  tproxy;
 static int  verbose;
 static int  workers;
 
-coroutine void forward(int in_s, int out_s, int ch)
+// partial receive
+static int precv(int s, void *buf, size_t len, int64_t deadline)
+{
+    while (1) {
+        ssize_t r = recv(s, buf, len, 0);
+        if (r >= 0) return r;
+        if (r < 0 && errno != EAGAIN) return -1;
+        if (fdin(s, deadline)) return -1;
+    }
+}
+
+static int brecv(int s, void *buf, size_t len, int64_t deadline)
+{
+    uint8_t *src = buf;
+    while (1) {
+        ssize_t r = recv(s, src, len, 0);
+        if (r == 0) {
+            errno = EPIPE;
+            return -1;
+        }
+        if (r > 0) {
+            src += r;
+            len -= r;
+            if (len == 0) return 0;
+        }
+        if (r < 0 && errno != EAGAIN) return -1;
+        if (fdin(s, deadline)) return -1;
+    }
+}
+
+static int bsend(int s, void *buf, size_t len, int64_t deadline)
+{
+    uint8_t *src = buf;
+    while (1) {
+        ssize_t r = send(s, src, len, MSG_NOSIGNAL);
+        if (r > 0) {
+            src += r;
+            len -= r;
+            if (len == 0) return 0;
+        }
+        if (r < 0 && errno != EAGAIN) return -1;
+        if (fdout(s, deadline)) return -1;
+    }
+}
+
+static coroutine void forward(int in_s, int out_s, int ch)
 {
     int64_t res = 0;
     while (1) {
-        uint8_t hdr[5];
-        if (brecv(in_s, hdr, 5, -1)) break;
-        if (bsend(out_s, hdr, 5, -1)) break;
-        res += 5;
-        int rec_len = hdr[3] << 8 | hdr[4];
-        if (rec_len > 0x4800) {
-            pr_info("Bad TLS rec_len = %d\n", rec_len);
-            break;
-        }
-        if (rec_len == 0) continue;
-        uint8_t rec[0x4800];
-        if (brecv(in_s, rec, rec_len, -1)) break;
-        if (bsend(out_s, rec, rec_len, -1)) break;
-        res += rec_len;
+        uint8_t buf[0x8000];
+        int r = precv(in_s, buf, sizeof(buf), -1);
+        if (r <= 0) break;
+        if (bsend(out_s, buf, r, -1)) break;
+        res += r;
     }
     // signal completion
     chsend(ch, &res, sizeof(res), -1);
@@ -77,7 +116,15 @@ static char *a2s_buf(struct ipaddr *a, char *buf)
 
 static int open_socket(int family, bool transparent);
 
-static int fd_connect(int s, struct ipaddr *addr)
+static void fd_close(int s)
+{
+    fdclean(s); // clear libdill state
+    struct linger l = { 1, 0 }; // close socket immediately
+    setsockopt(s, SOL_SOCKET, SO_LINGER, &l, sizeof(l));
+    close(s);
+}
+
+static int fd_connect(int s, const struct ipaddr *addr)
 {
     if (!connect(s, ipaddr_sockaddr(addr), ipaddr_len(addr)))
         return 0;   // succeeded immediately?
@@ -96,8 +143,7 @@ static int fd_connect(int s, struct ipaddr *addr)
     return 0;
 }
 
-// custom version of tcp_connect() that optionally binds to source address
-static int my_tcp_connect(struct ipaddr *src, struct ipaddr *dst)
+static int tproxy_connect(const struct ipaddr *src, const struct ipaddr *dst)
 {
     int s = open_socket(ipaddr_family(dst), tproxy & TPROXY_OUT);
     if (s < 0)
@@ -112,116 +158,85 @@ static int my_tcp_connect(struct ipaddr *src, struct ipaddr *dst)
         perror("connect");
         goto fail;
     }
-    int h = tcp_fromfd(s);
-    if (h < 0) {
-        perror("tcp_fromfd");
-        goto fail;
-    }
-    return h;
+    return s;
 fail:
-    fdclean(s); // clear libdill state
-    close(s);
+    fd_close(s);
     return -1;
 }
 
-coroutine void do_proxy(int fd)
+static int tls_handshake(int s, int s_rem, int64_t deadline)
 {
-    struct ipaddr src;
-    socklen_t addrlen = sizeof(src);
-    if (getpeername(fd, (struct sockaddr *)&src, &addrlen)) {
-        perror("getpeername");
-        close(fd);
-        return;
-    }
-
-    struct ipaddr dst;
-    addrlen = sizeof(dst);
-    if (tproxy & TPROXY_IN) {
-        // for TPROXY, getsockname() returns destination address
-        if (getsockname(fd, (struct sockaddr *)&dst, &addrlen)) {
-            perror("getsockname");
-            close(fd);
-            return;
-        }
-    } else {
-        // assume REDIRECT target
-        if (getsockopt(fd, SOL_IP, SO_ORIGINAL_DST, &dst, &addrlen) &&
-            getsockopt(fd, SOL_IPV6, SO_ORIGINAL_DST, &dst, &addrlen)) {
-            perror("getsockopt(SO_ORIGINAL_DST)");
-            close(fd);
-            return;
-        }
-    }
-    if (ipaddr_equal(&dst, &listen_ip4, 0) ||
-        ipaddr_equal(&dst, &listen_ip6, 0)) {
-        pr_info("Refusing to talk to self\n");
-        close(fd);
-        return;
-    }
-
-    int s = tcp_fromfd(fd);
-    if (s < 0) {
-        perror("tcp_fromfd");
-        close(fd);
-        return;
-    }
-
-    int s_rem = my_tcp_connect(&src, &dst);
-    if (s_rem < 0) {
-        tcp_close(s, -1);
-        return;
-    }
-
-    pr_info("Connect %s <--> %s\n", a2s(&src), a2s(&dst));
-    int64_t sent = 0, rcvd = 0;
-
     uint8_t hdr[5];
-    if (brecv(s, hdr, 5, -1)) goto fail0;
+    if (brecv(s, hdr, 1, deadline)) return -1;
     if (hdr[0] != TLS_HANDSHAKE) {
         pr_info("Expected TLS_HANDSHAKE, got %d\n", hdr[0]);
-        goto fail0;
+        return bsend(s_rem, hdr, 1, deadline);
     }
+    if (brecv(s, hdr + 1, 1, deadline)) return -1;
+    if (hdr[1] != 0x03) {
+        pr_info("Expected TLS version 3, got %d\n", hdr[1]);
+        return bsend(s_rem, hdr, 2, deadline);
+    }
+    if (brecv(s, hdr + 2, 3, deadline)) return -1;
     int rec_len = hdr[3] << 8 | hdr[4];
     if (rec_len == 0 || rec_len > 0x4000) {
         pr_info("Bad TLS handshake rec_len = %d\n", rec_len);
-        goto fail0;
+        return bsend(s_rem, hdr, 5, deadline);
     }
     pr_debug("TLS handshake rec_len = %d\n", rec_len);
 
     uint8_t rec[0x4000];
-    if (brecv(s, rec, rec_len, -1)) goto fail0;
+    if (brecv(s, rec, 1, deadline)) return -1;
     if (rec[0] != TLS_CLIENT_HELLO) {
         pr_info("Expected TLS_CLIENT_HELLO, got %d\n", rec[0]);
-        goto fail0;
+        if (bsend(s_rem, hdr, 5, deadline)) return -1;
+        if (bsend(s_rem, rec, 1, deadline)) return -1;
+        return 0;
     }
+    if (brecv(s, rec + 1, rec_len - 1, deadline)) return -1;
 
     int ofs = getofs(rec, rec_len);
     pr_debug("TLS hello offset = %d\n", ofs);
     if (ofs >= rec_len) {
         // already split, or no extensions
-        if (bsend(s_rem, hdr, 5, -1)) goto fail0;
-        if (bsend(s_rem, rec, rec_len, -1)) goto fail0;
+        if (bsend(s_rem, hdr, 5, deadline)) return -1;
+        if (bsend(s_rem, rec, rec_len, deadline)) return -1;
     } else {
         hdr[3] = ofs >> 8;
         hdr[4] = ofs & 0xff;
-        if (bsend(s_rem, hdr, 5, -1)) goto fail0;
-        if (bsend(s_rem, rec, ofs, -1)) goto fail0;
+        if (bsend(s_rem, hdr, 5, deadline)) return -1;
+        if (bsend(s_rem, rec, ofs, deadline)) return -1;
 
         int len = rec_len - ofs;
         hdr[3] = len >> 8;
         hdr[4] = len & 0xff;
-        if (bsend(s_rem, hdr, 5, -1)) goto fail0;
-        if (bsend(s_rem, rec + ofs, len, -1)) goto fail0;
+        if (bsend(s_rem, hdr, 5, deadline)) return -1;
+        if (bsend(s_rem, rec + ofs, len, deadline)) return -1;
     }
+    return 0;
+}
+
+static coroutine void do_proxy(int s, struct ipaddr src, struct ipaddr dst)
+{
+    int s_rem = tproxy_connect(&src, &dst);
+    if (s_rem < 0)
+        goto fail0;
+
+    pr_info("Connect %s <--> %s\n", a2s(&src), a2s(&dst));
+    int64_t sent = 0, rcvd = 0;
+
+    // give them 15 seconds to send handshake
+    if (tls_handshake(s, s_rem, now() + 15000)) goto fail1;
 
     int och[2], ich[2];
-    if (chmake(och)) goto fail0;
-    if (chmake(ich)) goto fail1;
+    if (chmake(och)) goto fail1;
+    if (chmake(ich)) goto fail2;
 
+    // start forwarding
     int ob = go(forward(s, s_rem, och[1]));
-    if (ob < 0) goto fail2;
+    if (ob < 0) goto fail3;
     int ib = go(forward(s_rem, s, ich[1]));
-    if (ib < 0) goto fail3;
+    if (ib < 0) goto fail4;
 
     struct chclause cc[] = {
         { CHRECV, och[0], &sent, sizeof(sent) },
@@ -231,51 +246,97 @@ coroutine void do_proxy(int fd)
     // wait until either side closes connection or error occurs
     switch (choose(cc, 2, -1)) {
     case 0: // incoming connection closed
-        tcp_done(s_rem, -1);
+        shutdown(s_rem, SHUT_WR);
         chrecv(ich[0], &rcvd, sizeof(rcvd), -1);
+        shutdown(s, SHUT_WR);
         break;
     case 1: // outgoing connection closed
-        tcp_done(s, -1);
+        shutdown(s, SHUT_WR);
         chrecv(och[0], &sent, sizeof(sent), -1);
+        shutdown(s_rem, SHUT_WR);
         break;
     }
 
-    pr_info("Disconnect %s <--> %s (%"PRId64" bytes sent, "
-            "%"PRId64" bytes rcvd)\n", a2s(&src), a2s(&dst), sent, rcvd);
     hclose(ib);
-fail3:
+fail4:
     hclose(ob);
-fail2:
+fail3:
     hclose(ich[0]);
-    hclose(ich[1]);
-fail1:
+    hclose(ich[0]);
+fail2:
     hclose(och[0]);
     hclose(och[1]);
+fail1:
+    pr_info("Disconnect %s <--> %s (%"PRId64" bytes sent, "
+            "%"PRId64" bytes rcvd)\n", a2s(&src), a2s(&dst), sent, rcvd);
+    fd_close(s_rem);
 fail0:
-    tcp_close(s_rem, -1);
-    tcp_close(s, -1);
+    fd_close(s);
 }
 
-coroutine void do_accept(int s)
+static int accept_new_conn(int fd, const struct ipaddr *src)
 {
-    while (1) {
-        if (fdin(s, -1)) {
-            perror("fdin");
-            return;
+    struct ipaddr dst;
+    socklen_t addrlen = sizeof(dst);
+    if (tproxy & TPROXY_IN) {
+        // for TPROXY, getsockname() returns destination address
+        if (getsockname(fd, (struct sockaddr *)&dst, &addrlen)) {
+            perror("getsockname");
+            goto fail;
         }
-        struct ipaddr addr;
-        socklen_t addrlen = sizeof(addr);
-        int fd = accept(s, (struct sockaddr *)&addr, &addrlen);
-        if (fd < 0) {
-            perror("accept");
-            continue;
-        }
-        if (bundle_go(workers, do_proxy(fd))) {
-            perror("bundle_go");
-            close(fd);
-            return;
+    } else {
+        // assume REDIRECT target
+        if (getsockopt(fd, SOL_IP, SO_ORIGINAL_DST, &dst, &addrlen) &&
+            getsockopt(fd, SOL_IPV6, SO_ORIGINAL_DST, &dst, &addrlen)) {
+            perror("getsockopt(SO_ORIGINAL_DST)");
+            goto fail;
         }
     }
+    if (ipaddr_equal(&dst, &listen_ip4, 0) ||
+        ipaddr_equal(&dst, &listen_ip6, 0)) {
+        pr_info("Refusing to talk to self\n");
+        goto fail;
+    }
+    if (bundle_go(workers, do_proxy(fd, *src, dst))) {
+        perror("bundle_go");
+        fd_close(fd);
+        return -1;
+    }
+    return 0;
+fail:
+    fd_close(fd);
+    return 0;
+}
+
+static coroutine void do_accept(int s)
+{
+    int spare_fd = dup(s);
+    while (1) {
+        struct ipaddr src;
+        socklen_t addrlen = sizeof(src);
+        int fd = accept4(s, (struct sockaddr *)&src, &addrlen, SOCK_NONBLOCK);
+        if (fd >= 0) {
+            if (accept_new_conn(fd, &src)) break;
+            continue;
+        }
+        int err = errno;
+        if (err == EAGAIN) {
+            if (fdin(s, -1)) break;
+            continue;
+        }
+        perror("accept4");
+        if (err == EMFILE) {
+            close(spare_fd);
+            fd = accept4(s, (struct sockaddr *)&src, &addrlen, SOCK_NONBLOCK);
+            if (fd >= 0) {
+                fd_close(fd);
+                spare_fd = dup(s);
+            }
+        }
+    }
+    close(spare_fd);
+    fdclean(s);
+    close(s);
 }
 
 static int open_socket(int family, bool transparent)
