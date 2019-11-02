@@ -92,6 +92,7 @@ static coroutine void forward(int in_s, int out_s, int ch)
     }
     // signal completion
     chsend(ch, &res, sizeof(res), -1);
+    chdone(ch);
 }
 
 static int getofs(const uint8_t *rec, int rec_len)
@@ -116,11 +117,13 @@ static char *a2s_buf(struct ipaddr *a, char *buf)
 
 static int open_socket(int family, bool transparent);
 
-static void fd_close(int s)
+static void fd_close(int s, bool drop)
 {
     fdclean(s); // clear libdill state
-    struct linger l = { 1, 0 }; // close socket immediately
-    setsockopt(s, SOL_SOCKET, SO_LINGER, &l, sizeof(l));
+    if (drop) {
+        struct linger l = { 1, 0 }; // disconnect socket immediately
+        setsockopt(s, SOL_SOCKET, SO_LINGER, &l, sizeof(l));
+    }
     close(s);
 }
 
@@ -160,7 +163,7 @@ static int tproxy_connect(const struct ipaddr *src, const struct ipaddr *dst)
     }
     return s;
 fail:
-    fd_close(s);
+    fd_close(s, true);
     return -1;
 }
 
@@ -218,6 +221,7 @@ static int tls_handshake(int s, int s_rem, int64_t deadline)
 
 static coroutine void do_proxy(int s, struct ipaddr src, struct ipaddr dst)
 {
+    bool drop = true;
     int s_rem = tproxy_connect(&src, &dst);
     if (s_rem < 0)
         goto fail0;
@@ -246,14 +250,14 @@ static coroutine void do_proxy(int s, struct ipaddr src, struct ipaddr dst)
     // wait until either side closes connection or error occurs
     switch (choose(cc, 2, -1)) {
     case 0: // incoming connection closed
-        shutdown(s_rem, SHUT_WR);
-        chrecv(ich[0], &rcvd, sizeof(rcvd), -1);
-        shutdown(s, SHUT_WR);
+        if (shutdown(s_rem, SHUT_WR)) break;
+        if (chrecv(ich[0], &rcvd, sizeof(rcvd), -1)) break;
+        drop = false;
         break;
     case 1: // outgoing connection closed
-        shutdown(s, SHUT_WR);
-        chrecv(och[0], &sent, sizeof(sent), -1);
-        shutdown(s_rem, SHUT_WR);
+        if (shutdown(s, SHUT_WR)) break;
+        if (chrecv(och[0], &sent, sizeof(sent), -1)) break;
+        drop = false;
         break;
     }
 
@@ -267,11 +271,14 @@ fail2:
     hclose(och[0]);
     hclose(och[1]);
 fail1:
-    pr_info("Disconnect %s <--> %s (%"PRId64" bytes sent, "
-            "%"PRId64" bytes rcvd)\n", a2s(&src), a2s(&dst), sent, rcvd);
-    fd_close(s_rem);
+    pr_info("Disconnect %s <--> %s ", a2s(&src), a2s(&dst));
+    if (drop)
+        pr_info("(with error)\n");
+    else
+        pr_info("(%"PRId64" bytes sent, %"PRId64" bytes rcvd)\n", sent, rcvd);
+    fd_close(s_rem, drop);
 fail0:
-    fd_close(s);
+    fd_close(s, drop);
 }
 
 static int accept_new_conn(int fd, const struct ipaddr *src)
@@ -299,12 +306,12 @@ static int accept_new_conn(int fd, const struct ipaddr *src)
     }
     if (bundle_go(workers, do_proxy(fd, *src, dst))) {
         perror("bundle_go");
-        fd_close(fd);
+        fd_close(fd, true);
         return -1;
     }
     return 0;
 fail:
-    fd_close(fd);
+    fd_close(fd, true);
     return 0;
 }
 
@@ -325,18 +332,17 @@ static coroutine void do_accept(int s)
             continue;
         }
         perror("accept4");
-        if (err == EMFILE) {
+        if (err == ENFILE || err == EMFILE) {
             close(spare_fd);
             fd = accept4(s, (struct sockaddr *)&src, &addrlen, SOCK_NONBLOCK);
             if (fd >= 0) {
-                fd_close(fd);
+                fd_close(fd, true);
                 spare_fd = dup(s);
             }
         }
     }
     close(spare_fd);
-    fdclean(s);
-    close(s);
+    fd_close(s, false);
 }
 
 static int open_socket(int family, bool transparent)
