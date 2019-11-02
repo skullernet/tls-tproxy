@@ -173,18 +173,21 @@ static int tls_handshake(int s, int s_rem, int64_t deadline)
     if (brecv(s, hdr, 1, deadline)) return -1;
     if (hdr[0] != TLS_HANDSHAKE) {
         pr_info("Expected TLS_HANDSHAKE, got %d\n", hdr[0]);
-        return bsend(s_rem, hdr, 1, deadline);
+        if (bsend(s_rem, hdr, 1, deadline)) return -1;
+        return 1;
     }
     if (brecv(s, hdr + 1, 1, deadline)) return -1;
     if (hdr[1] != 0x03) {
         pr_info("Expected TLS version 3, got %d\n", hdr[1]);
-        return bsend(s_rem, hdr, 2, deadline);
+        if (bsend(s_rem, hdr, 2, deadline)) return -1;
+        return 2;
     }
     if (brecv(s, hdr + 2, 3, deadline)) return -1;
     int rec_len = hdr[3] << 8 | hdr[4];
     if (rec_len == 0 || rec_len > 0x4000) {
         pr_info("Bad TLS handshake rec_len = %d\n", rec_len);
-        return bsend(s_rem, hdr, 5, deadline);
+        if (bsend(s_rem, hdr, 5, deadline)) return -1;
+        return 5;
     }
     pr_debug("TLS handshake rec_len = %d\n", rec_len);
 
@@ -194,7 +197,7 @@ static int tls_handshake(int s, int s_rem, int64_t deadline)
         pr_info("Expected TLS_CLIENT_HELLO, got %d\n", rec[0]);
         if (bsend(s_rem, hdr, 5, deadline)) return -1;
         if (bsend(s_rem, rec, 1, deadline)) return -1;
-        return 0;
+        return 6;
     }
     if (brecv(s, rec + 1, rec_len - 1, deadline)) return -1;
 
@@ -204,19 +207,20 @@ static int tls_handshake(int s, int s_rem, int64_t deadline)
         // already split, or no extensions
         if (bsend(s_rem, hdr, 5, deadline)) return -1;
         if (bsend(s_rem, rec, rec_len, deadline)) return -1;
-    } else {
-        hdr[3] = ofs >> 8;
-        hdr[4] = ofs & 0xff;
-        if (bsend(s_rem, hdr, 5, deadline)) return -1;
-        if (bsend(s_rem, rec, ofs, deadline)) return -1;
-
-        int len = rec_len - ofs;
-        hdr[3] = len >> 8;
-        hdr[4] = len & 0xff;
-        if (bsend(s_rem, hdr, 5, deadline)) return -1;
-        if (bsend(s_rem, rec + ofs, len, deadline)) return -1;
+        return 5 + rec_len;
     }
-    return 0;
+
+    hdr[3] = ofs >> 8;
+    hdr[4] = ofs & 0xff;
+    if (bsend(s_rem, hdr, 5, deadline)) return -1;
+    if (bsend(s_rem, rec, ofs, deadline)) return -1;
+
+    int len = rec_len - ofs;
+    hdr[3] = len >> 8;
+    hdr[4] = len & 0xff;
+    if (bsend(s_rem, hdr, 5, deadline)) return -1;
+    if (bsend(s_rem, rec + ofs, len, deadline)) return -1;
+    return 10 + rec_len;
 }
 
 static coroutine void do_proxy(int s, struct ipaddr src, struct ipaddr dst)
@@ -230,7 +234,8 @@ static coroutine void do_proxy(int s, struct ipaddr src, struct ipaddr dst)
     int64_t sent = 0, rcvd = 0;
 
     // give them 15 seconds to send handshake
-    if (tls_handshake(s, s_rem, now() + 15000)) goto fail1;
+    int hs_len = tls_handshake(s, s_rem, now() + 15000);
+    if (hs_len < 0) goto fail1;
 
     int och[2], ich[2];
     if (chmake(och)) goto fail1;
@@ -275,7 +280,7 @@ fail1:
     if (drop)
         pr_info("(with error)\n");
     else
-        pr_info("(%"PRId64" bytes sent, %"PRId64" bytes rcvd)\n", sent, rcvd);
+        pr_info("(%"PRId64" bytes sent, %"PRId64" bytes rcvd)\n", sent + hs_len, rcvd);
     fd_close(s_rem, drop);
 fail0:
     fd_close(s, drop);
