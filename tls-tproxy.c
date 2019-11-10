@@ -337,7 +337,7 @@ static coroutine void do_accept(int s)
             continue;
         }
         perror("accept4");
-        if (err == ENFILE || err == EMFILE) {
+        if (err == EMFILE) {
             close(spare_fd);
             fd = accept4(s, (struct sockaddr *)&src, &addrlen, SOCK_NONBLOCK);
             if (fd >= 0) {
