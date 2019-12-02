@@ -1,7 +1,7 @@
 # tls-tproxy
 
-Transparent TLS proxy to work around DPI firewall blocks. The idea is to split
-client hello message across multiple TLS records so that all extensions
+Transparent TLS proxy to work around DPI firewall restrictions. The idea is to
+split client hello message across multiple TLS records so that all extensions
 (including SNI) end up in the second record. Actual TLS message content is not
 modified and thus no special configuration is needed on connection endpoints.
 
@@ -9,6 +9,7 @@ At least some sites are known to break with this, so be careful.
 
 ## Requirements
 
+* Linux kernel with iptables support
 * libdill ≥ 2.14
 
 ## Usage
@@ -26,9 +27,9 @@ At least some sites are known to break with this, so be careful.
 * `-v` — more verbose output (can be used multiple times)
 * `-h` — show help
 
-`-t` and `-T` options require root privileges. Unless `-t` option is given, it
-is assumed REDIRECT iptables rule is used to pass connections through the
-proxy.
+`-t` and `-T` options require CAP\_NET\_ADMIN capability. Unless `-t` option is
+given, it is assumed REDIRECT iptables rule is used to pass connections through
+the proxy.
 
 ## Examples
 
